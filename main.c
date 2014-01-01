@@ -2,10 +2,12 @@
 #include <stdlib.h>
 #include <windows.h>
 #include <winsock2.h>
+#include "cJSON.h"
 
 #define DEFAULT_HTTP_PROXY_ADDRESS "202.194.64.201"
 #define HTTP_PROXY_PORT 8000
 #define LISTEN_PORT 8088
+#define REMOTE_CTL_PORT 8089
 #define EXE_NAME "FKCCProxy"
 #define BUFFER_SIZE 64*1024 //64KB
 #define LOG_FILE_NAME "C:\\FKCCProxy.log"
@@ -20,7 +22,7 @@ typedef struct connection_context_s {
     HANDLE                        main_thread;
 } connection_context_t;
 
-connection_context_t    g_main_ctx;
+connection_context_t    g_main_ctx, g_remote_ctl_ctx;
 SERVICE_STATUS_HANDLE   g_service_status_handle;
 CRITICAL_SECTION        g_cs_for_gc;
 DWORD                   g_current_status = 0;
@@ -154,11 +156,13 @@ DWORD WINAPI connection_from_client_service( void *cnnct_ctx_ptr )
     WaitForSingleObject( thread_for_proxy, INFINITE );
     CloseHandle( thread_for_proxy );
 
+#ifdef DEBUG
     struct sockaddr_in client_addr;
     int addr_len = sizeof( struct sockaddr );
     getpeername( connect_ctx_ptr->from_client.sock, ( struct sockaddr * )&client_addr, &addr_len );
     printf( "Close a connection to %s:%d\n", inet_ntoa( client_addr.sin_addr ), ntohs( client_addr.sin_port ) );
     fflush( stdout );
+#endif // DEBUG
 
     closesocket( connect_ctx_ptr->to_proxy.sock );
     closesocket( connect_ctx_ptr->from_client.sock );
@@ -167,15 +171,173 @@ DWORD WINAPI connection_from_client_service( void *cnnct_ctx_ptr )
     return 1;
 }
 
+SOCKET make_sock_for_listen( short port )
+{
+    SOCKET server_sock = socket( AF_INET, SOCK_STREAM, IPPROTO_TCP );
+    if ( INVALID_SOCKET != server_sock ) {
+        struct sockaddr_in local_addr;
+        memset( &local_addr, 0, sizeof( struct sockaddr_in ) );
+        local_addr.sin_addr.s_addr = INADDR_ANY;
+        local_addr.sin_family      = AF_INET;
+        local_addr.sin_port        = htons( port );
+        int nREUSEADDR = 1;
+        setsockopt( server_sock, SOL_SOCKET, SO_REUSEADDR, ( const char * )&nREUSEADDR, sizeof( nREUSEADDR ) );
+        if ( bind( server_sock, ( struct sockaddr * )&local_addr, sizeof( local_addr ) ) != 0 ) {
+            printf( "Fail to bind port!\n" );
+            fflush( stdout );
+            goto fail_exit;
+        }
+        if ( listen( server_sock, 15 ) != 0 ) {
+            printf( "Fail to listen port!\n" );
+            fflush( stdout );
+            goto fail_exit;
+        }
+    }
+    return server_sock;
+
+fail_exit:
+    closesocket( server_sock );
+    return INVALID_SOCKET;
+}
+
+SOCKET accept_connection( SOCKET listen_sock, struct sockaddr_in *client_addr, int *addr_len )
+{
+    SOCKET from_client_sock = INVALID_SOCKET;
+    while ( ( from_client_sock = accept( listen_sock, ( struct sockaddr * )client_addr, addr_len ) ) == INVALID_SOCKET ) {
+#ifdef DEBUG
+        char err_msg[256];
+        FormatMessage( FORMAT_MESSAGE_FROM_SYSTEM, ( PCVOID )FORMAT_MESSAGE_FROM_HMODULE, WSAGetLastError(), 0, err_msg, 256, NULL );
+        printf( "Accept Error: %s", err_msg );
+        fflush( stdout );
+#endif // DEBUG
+        switch ( WSAGetLastError() ) {
+            case WSAENOBUFS:
+            case WSAEMFILE:
+                Sleep( 1000 * 60 * 5 );
+                break;
+            case WSAECONNRESET:
+                printf( "Incomming connection was indicated, but was subsequently terminated by the remote peer prior to accepting the call\n" );
+                fflush( stdout );
+                break;
+            default:
+                return INVALID_SOCKET;
+        }
+    }
+#ifdef DEBUG
+    printf( "Make a connection for %s:%d\n", inet_ntoa( client_addr->sin_addr ), ntohs( client_addr->sin_port ) );
+#endif // DEBUG
+    return from_client_sock;
+}
+
+//return the length which don't include '\0' of result string
+int fill_connection_info_using_json_str( char *connection_info, int buf_size )
+{
+    cJSON *json_root = cJSON_CreateObject();
+    cJSON_AddItemToObject( json_root, "ret_code", cJSON_CreateNumber( 0 ) );
+    cJSON *json_client = cJSON_CreateObject();
+    cJSON_AddItemToObject( json_root, "client", json_client );
+    cJSON *json_client_list = cJSON_CreateArray();
+
+    EnterCriticalSection( &g_cs_for_gc );
+    unsigned client_count = 0;
+    for ( connection_context_t *curr = g_main_ctx.next; curr; curr = curr->next ) {
+        if ( curr->from_client.sock == curr->to_proxy.sock && curr->from_client.sock == 0 ) { continue; }
+        struct sockaddr_in client_addr;
+        int addr_len = sizeof( struct sockaddr );
+        getpeername( curr->from_client.sock, ( struct sockaddr * )&client_addr, &addr_len );
+        char client_addr_str[20];
+        sprintf( client_addr_str, "%s:%d", inet_ntoa( client_addr.sin_addr ), ntohs( client_addr.sin_port ) );
+        cJSON_AddItemToArray( json_client_list, cJSON_CreateString( client_addr_str ) );
+        client_count++;
+    }
+    LeaveCriticalSection( &g_cs_for_gc );
+
+    cJSON_AddItemToObject( json_client, "count", cJSON_CreateNumber( client_count ) );
+    cJSON_AddItemToObject( json_client, "list", json_client_list );
+    char *json_str = cJSON_Print( json_root );
+    int str_len = strlen( json_str ) + 1;
+    int cpy_len = min( buf_size, str_len );
+    memcpy( connection_info, json_str, cpy_len - 1 );
+    connection_info[cpy_len] = '\0';
+    free( json_str );
+    cJSON_Delete( json_root );
+    return cpy_len - 1;
+}
+
+DWORD WINAPI remote_ctrl_service( void *nothing )
+{
+    g_remote_ctl_ctx.from_client.sock = make_sock_for_listen( REMOTE_CTL_PORT );
+    if ( INVALID_SOCKET == g_remote_ctl_ctx.from_client.sock ) {
+        printf( "Can not create socket for remote control service, remote control will be unavilable!\n" );
+        fflush( stdout );
+        return 0;
+    }
+
+    printf( "Remote control service running...\n" );
+    fflush( stdout );
+
+    while ( 1 ) {
+        //accept connection
+        struct sockaddr_in client_addr;
+        int addr_len = sizeof( struct sockaddr_in );
+        SOCKET from_client_sock = accept_connection( g_remote_ctl_ctx.from_client.sock, &client_addr, &addr_len );
+        if ( INVALID_SOCKET == from_client_sock ) {
+            printf( "Now, remote control service stoping work...\n" );
+            fflush( stdout );
+            break;
+        }
+        printf( "Remote control %s:%d online.\n", inet_ntoa( client_addr.sin_addr ), ntohs( client_addr.sin_port ) );
+
+        char request[1024 * 4];
+        int recv_size = recv( from_client_sock, request, 1024 * 4, 0 );
+        if ( SOCKET_ERROR != recv_size && 0 != recv_size ) {
+            //parse the request
+            //TODO actually parse the request
+            unsigned sum = 0;
+            for ( int i = recv_size - 4; i < recv_size; i++ ) {
+                sum += request[i];
+            }
+            if ( sum == 2 * '\r' + 2 * '\n' ) {
+                //send the response
+                char response[1024 * 16], connection_info[1024 * 10];
+                int cnnt_info_str_len = fill_connection_info_using_json_str( connection_info, 1024 * 10 );
+                int response_len = sprintf( response,
+                                            "HTTP/1.1 200 OK\r\n"
+                                            "Content-Length:%d\r\n"
+                                            "Content-Type:application/json\r\n"
+                                            "\r\n"
+                                            "%s",
+                                            cnnt_info_str_len, connection_info );
+#ifdef DEBUG
+                printf( "JSON to client: %s\n", connection_info );
+                printf( "Response to client: %s\n", response );
+                fflush( stdout );
+#endif // DEBUG
+                send( from_client_sock, response, response_len, 0 );
+            }
+        }
+        shutdown( from_client_sock, SD_BOTH );
+        closesocket( from_client_sock );
+        printf( "Remote control %s:%d offline.\n", inet_ntoa( client_addr.sin_addr ), ntohs( client_addr.sin_port ) );
+        fflush( stdout );
+    }
+    return 1;
+}
+
 void close_all_sockets()
 {
+    printf( "Now, close all sockets...\n" );
+    fflush( stdout );
     for ( connection_context_t *curr = g_main_ctx.next; curr; curr = curr->next ) {
         if ( curr->from_client.sock ) {
             shutdown( curr->from_client.sock, SD_BOTH );
-            WaitForSingleObject( curr->main_thread, INFINITE );
+            //FIXME: wait for a thread finished will take a long time, then Windows will report an error!
+            //WaitForSingleObject( curr->main_thread, INFINITE );
         }
         CloseHandle( curr->main_thread );
     }
+    printf( "All sockets have been closed!\n" );
+    fflush( stdout );
 }
 
 int WINAPI ServiceMain( int argc, char **argv )
@@ -191,8 +353,10 @@ int WINAPI ServiceMain( int argc, char **argv )
     freopen( LOG_FILE_NAME, "w", stdout );
 
     g_main_ctx.next = NULL;
-    g_main_ctx.from_client.sock = socket( AF_INET, SOCK_STREAM, IPPROTO_TCP );
-    if ( g_main_ctx.from_client.sock == INVALID_SOCKET ) {
+    g_main_ctx.from_client.sock = make_sock_for_listen( LISTEN_PORT );
+    if ( INVALID_SOCKET == g_main_ctx.from_client.sock ) {
+        printf( "Can not create socket for this proxy!\n" );
+        fflush( stdout );
         return -1;
     }
 
@@ -208,23 +372,7 @@ int WINAPI ServiceMain( int argc, char **argv )
     printf( "I'm working...\n" );
     fflush( stdout );
 
-    struct sockaddr_in local_addr;
-    memset( &local_addr, 0, sizeof( struct sockaddr_in ) );
-    local_addr.sin_addr.s_addr = INADDR_ANY;
-    local_addr.sin_family      = AF_INET;
-    local_addr.sin_port        = htons( LISTEN_PORT );
-    int nREUSEADDR = 1;
-    setsockopt( g_main_ctx.from_client.sock, SOL_SOCKET, SO_REUSEADDR, ( const char * )&nREUSEADDR, sizeof( nREUSEADDR ) );
-    if ( bind( g_main_ctx.from_client.sock, ( struct sockaddr * )&local_addr, sizeof( local_addr ) ) != 0 ) {
-        printf( "Fail to bind port!\n" );
-        fflush( stdout );
-        goto here_exit;
-    }
-    if ( listen( g_main_ctx.from_client.sock, 15 ) != 0 ) {
-        printf( "Fail to listen port!\n" );
-        fflush( stdout );
-        goto here_exit;
-    }
+    g_remote_ctl_ctx.main_thread = CreateThread( NULL, 0, remote_ctrl_service, NULL, 0, NULL );
 
     while ( 1 ) {
         connection_context_t *connect_ctx_ptr = ( connection_context_t * )malloc( sizeof( connection_context_t ) );
@@ -233,32 +381,13 @@ int WINAPI ServiceMain( int argc, char **argv )
         //accept connection
         struct sockaddr_in client_addr;
         int addr_len = sizeof( struct sockaddr_in );
-        connect_ctx_ptr->from_client.sock = accept( g_main_ctx.from_client.sock, ( struct sockaddr * )&client_addr, &addr_len );
+        connect_ctx_ptr->from_client.sock = accept_connection( g_main_ctx.from_client.sock, &client_addr, &addr_len );
         if ( INVALID_SOCKET == connect_ctx_ptr->from_client.sock ) {
             free( connect_ctx_ptr );
-#ifdef DEBUG
-            char err_msg[256];
-            FormatMessage( FORMAT_MESSAGE_FROM_SYSTEM, ( PCVOID )FORMAT_MESSAGE_FROM_HMODULE, WSAGetLastError(), 0, err_msg, 256, NULL );
-            printf( "Accept Error: %s\n", err_msg );
+            printf( "Stop working...\n" );
             fflush( stdout );
-#endif // DEBUG
-            int need_break = 0;
-            switch ( WSAGetLastError() ) {
-                case WSAENOBUFS:
-                case WSAEMFILE:
-                    Sleep( 1000 * 60 * 5 );
-                    break;
-                case WSAECONNRESET:
-                    printf( "Incomming connection was indicated, but was subsequently terminated by the remote peer prior to accepting the call\n" );
-                    fflush( stdout );
-                    break;
-                default:
-                    need_break = 1;
-                    break;
-            }
-            if ( need_break ) { break; }
+            break;
         }
-        printf( "Make a connection for %s:%d\n", inet_ntoa( client_addr.sin_addr ), ntohs( client_addr.sin_port ) );
 
         EnterCriticalSection( &g_cs_for_gc );
         connect_ctx_ptr->next = g_main_ctx.next;
@@ -268,10 +397,13 @@ int WINAPI ServiceMain( int argc, char **argv )
         connect_ctx_ptr->main_thread = CreateThread( NULL, 0, connection_from_client_service, connect_ctx_ptr, 0, NULL );
         fflush( stdout );
     }
+    shutdown( g_remote_ctl_ctx.from_client.sock, SD_BOTH );
+    closesocket( g_remote_ctl_ctx.from_client.sock );
+    WaitForSingleObject( g_remote_ctl_ctx.main_thread, INFINITE );
+    CloseHandle( g_remote_ctl_ctx.main_thread );
     close_all_sockets();
     closesocket( g_main_ctx.from_client.sock );
 
-here_exit:
     printf( "Bye!\n" );
     fclose( stdout );
 
