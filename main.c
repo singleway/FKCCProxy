@@ -5,9 +5,17 @@
 #include <time.h>
 #include "cJSON.h"
 
-#define DEFAULT_HTTP_PROXY_ADDRESS "202.194.64.201"
-#define HTTP_PROXY_PORT 8000
-#define LISTEN_PORT 8088
+#define PPTP_MODE
+
+#ifdef PPTP_MODE
+#  define DEFAULT_REMOTE_PROXY_ADDRESS "211.64.93.144"
+#  define REMOTE_PROXY_PORT 1723
+#  define LISTEN_PORT REMOTE_PROXY_PORT
+#else
+#  define DEFAULT_REMOTE_PROXY_ADDRESS "202.194.64.201"
+#  define REMOTE_PROXY_PORT 8000
+#  define LISTEN_PORT 8088
+#endif
 #define REMOTE_CTL_PORT 8089
 #define EXE_NAME "FKCCProxy"
 #define BUFFER_SIZE 64*1024 //64KB
@@ -114,9 +122,9 @@ SOCKET make_connection_to_proxy()
 {
     struct sockaddr_in proxy_addr;
     memset( &proxy_addr, 0, sizeof( proxy_addr ) );
-    proxy_addr.sin_addr.s_addr = inet_addr( DEFAULT_HTTP_PROXY_ADDRESS );
+    proxy_addr.sin_addr.s_addr = inet_addr( DEFAULT_REMOTE_PROXY_ADDRESS );
     proxy_addr.sin_family      = AF_INET;
-    proxy_addr.sin_port        = htons( HTTP_PROXY_PORT );
+    proxy_addr.sin_port        = htons( REMOTE_PROXY_PORT );
 
     SOCKET sock_to_proxy = socket( AF_INET, SOCK_STREAM, IPPROTO_TCP );
     if ( sock_to_proxy != INVALID_SOCKET ) {
